@@ -61,13 +61,17 @@
  *     - The open/close time is the time elapsed from when the shade starts moving until it reaches the fully
  *       open/closed position.
  *
- * Source: https://github.com/TODO
+ * Source: https://github.com/esimioni/hubitat-window-shade-timed
  * Author: Eduardo Simioni
  *
+ * Changelog:
+ * 1.1.1 (2026-03-10) [Eduardo Simioni] - Added HPM manifest for easier installation.
+ *                                      - Added log level cache to avoid redundant calculations.
+ *                                      - Removed unused initialize() method.
  * 1.1.0 (2026-03-05) [Eduardo Simioni] - Added support for Sonoff MINI-ZBRBS, Turbo Mode and many other improvements.
  * 1.0.0 (2021-05-03) [Eduardo Simioni] - Initial version
  *
- * References:
+ * Related discussions:
  *   https://community.hubitat.com/t/any-way-to-programmatically-set-position-of-motorized-blinds/43092/16
  *   https://community.hubitat.com/t/cellular-blinds-with-zigbee-or-direct-hubitat-communication/62402/15
  *   https://community.hubitat.com/t/zigbee-cutain-module-ts130f/107907/26
@@ -98,9 +102,11 @@ metadata {
         input(name: 'closeStartDelay', type: 'number', title: 'Motor start delay (close)', description: 'Motor delay in ms after you hear the switch click', defaultValue: '186', range: '-5000..5000', required: true, displayDuringSetup: true)
         input(name: 'openCloseSafetyMargin', type: 'number', title: 'Open/Close safety margin', description: 'In milliseconds', defaultValue: '1000', range: '0..5000', required: true)
         input(name: 'turboMode', type: 'enum', title: 'Turbo Mode (Sonoff only)', description: 'Increases Zigbee radio power for better range.', defaultValue: '9', required: true, options: ['9':'Disabled', '20':'Enabled'])
-        input(name: 'loggingLevel', type: 'enum', title: 'Logging level', description: '', defaultValue: '3', required: true, options: ['1':'Error', '2':'Warning', '3':'Info', '4':'Debug', '5':'Trace'])
+        input(name: 'loggingLevel', type: 'enum', title: 'Logging level', options: ['1':'Error', '2':'Warning', '3':'Info', '4':'Debug', '5':'Trace'], defaultValue: '3', required: true)
     }
 }
+
+@Field int cachedLoggingLevel = -1
 
 @Field static final CLUSTER_SHADE_BLIND    = 0x0102
 
@@ -285,7 +291,8 @@ void setPosition(position) {
     }
     def currentPos = getCurrentPosition()
     def isChange = Math.abs(position - currentPos) > 1
-    logger('I', {"setPosition(${position}%) - Current position is ${currentPos}%" + getHumanPosition(currentPos) + (isChange ? '' : ' - Ignoring change to the same position (±1%)')})
+    def semiBlindLabel = (position == SEMI_BLIND_POSITION && settings.semiBlindTime > 0) ? ' (Semi-blind)' : ''
+    logger('I', {"setPosition(${position}%)${semiBlindLabel} - Current position is ${currentPos}%" + getHumanPosition(currentPos) + (isChange ? '' : ' - Ignoring change to the same position (±1%)')})
     if (!isChange) {
         return
     }
@@ -499,18 +506,15 @@ void installed() {
 
 void updated() {
     logger('I', 'Preferences updated...')
+    updateCachedLoggingLevel()
     setTurboMode(safeToInt(settings.turboMode, 9))
 }
 
-void initialize() {
-    logger('I', 'Initialized...')
-    resetState()
-}
-
 void resetState() {
+    logger('I', 'Resetting state...')
     unschedule()
     if (state.resetPosition == null) {
-        state.resetPosition = 50
+        state.resetPosition = getCurrentPosition() ?: 50
     }
     state.motionStartTime = 0
     state.pauseTime = 0
@@ -561,7 +565,7 @@ void sendZigbeeCommands(List<String> cmd) {
 }
 
 private void logger(level, message) {
-    int configuredLevel = safeToInt(settings.loggingLevel, 3)
+    int configuredLevel = getCachedLoggingLevel()
     switch (level) {
         case 'E': if (configuredLevel >= 1) { log.error(getLogMessage(message)) }; break
         case 'W': if (configuredLevel >= 2) { log.warn(getLogMessage(message)) }; break
@@ -574,4 +578,14 @@ private void logger(level, message) {
 private String getLogMessage(message) {
     def text = (message instanceof Closure) ? message() : message
     return "${device.displayName}: ${text}"
+}
+
+private void updateCachedLoggingLevel() {
+    cachedLoggingLevel = safeToInt(settings.loggingLevel, 3)
+}
+
+private int getCachedLoggingLevel() {
+    if (cachedLoggingLevel >= 0) return cachedLoggingLevel
+     cachedLoggingLevel = (settings.loggingLevel as String)?.toInteger() ?: 3
+    return cachedLoggingLevel
 }
