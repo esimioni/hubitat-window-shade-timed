@@ -65,6 +65,9 @@
  * Author: Eduardo Simioni
  *
  * Changelog:
+ * 1.1.2 (2026-08-06) [Eduardo Simioni] - Fixed positions drifting after back-to-back commands: the driver now runs
+ *                                        single threaded, so concurrent executions can no longer overwrite each
+ *                                        other's state and make the driver measure travel from an earlier movement.
  * 1.1.1 (2026-03-10) [Eduardo Simioni] - Added HPM manifest for easier installation.
  *                                      - Added log level cache to avoid redundant calculations.
  *                                      - Removed unused initialize() method.
@@ -84,10 +87,13 @@ import groovy.transform.Field
 import java.math.RoundingMode
 
 metadata {
-    definition(name: 'Zigbee Window Shade/Blind (Timed)', namespace: 'edu', author: 'Eduardo Simioni') {
+    // singleThreaded: the position estimate relies on state (motionStartTime, scheduledPauseTime) written by
+    // one execution and read by another. Without it, a command call and the Zigbee echo run concurrently, each
+    // saving its own snapshot of state on exit, so the later one silently reverts the other's writes.
+    definition(name: 'Zigbee Window Shade/Blind (Timed)', namespace: 'edu', author: 'Eduardo Simioni', singleThreaded: true) {
         capability 'Window Shade'
 
-        command 'resetPosition', [[name: 'position*', type: 'NUMBER', constraints: ['NUMBER'], defaultValue : '50', range: '0..100', description: 'Changes only the driver state, no commands are sent to the device']]
+        command 'resetPosition', [[name: 'position*', type: 'NUMBER', constraints: ['NUMBER'], defaultValue : '50', range: '0..100', description: 'Updates the driver state to match the physical position.<br/> No commands are sent to the device']]
 
         fingerprint model: 'TS130F', manufacturer: '_TZ3000_iaxvag8w', profileId: '0104', endpointId: '01', inClusters: '0000,0003,0004,0005,0102', outClusters: '', deviceJoinName: 'Zemismart Zigbee Curtain Module ZW-EC-01'
         fingerprint model: 'TS130F', manufacturer: '_TZ3000_femsaaua', profileId: '0104', endpointId: '01', inClusters: '0004,0005,0006,0102,E001,0000', outClusters: '0019,000A', deviceJoinName: 'LoraTap Zigbee Curtain Module SC-500-ZB'
@@ -135,7 +141,7 @@ metadata {
 @Field static final FULLY_OPENED           = 100
 @Field static final FULLY_CLOSED           = 0
 
-@Field static final ZIGBEE_DELAY_LIMIT     = 150
+@Field static final ZIGBEE_DELAY_LIMIT     = 500
 // To be more precise on the positioning, when closer to the lower limit, first close fully (if target position is below threshold), then set the position
 @Field static final INVERTED_THRESHOLD     = 5
 // Semi-blind position: when this percentage is requested, uses semiBlindTime preference for precise positioning
@@ -156,7 +162,7 @@ def parse(String description) {
     if (descMap && descMap.clusterInt == CLUSTER_SHADE_BLIND) {
         logger('D', 'Shade cluster command received')
         def command = getCommandFromDescMap(descMap)
-        logger('I', {"Received command: ${command}"})
+        logReceivedCommand(command, descMap)
         if (command == getInCommandPause()) {
             pauseReceived()
         } else if (command == getInCommandClose() || command == getInCommandOpen()) {
@@ -174,14 +180,10 @@ def parse(String description) {
 
 String getCommandFromDescMap(Map descMap) {
     if (isTuya()) {
-        return descMap.additionalAttrs ? descMap.additionalAttrs[0].value : getUnknownCommandDesc(descMap)
+        return descMap.additionalAttrs ? descMap.additionalAttrs[0].value : null
     } else {
-        return descMap.data ? descMap.data[0] : getUnknownCommandDesc(descMap)
+        return descMap.data ? descMap.data[0] : null
     }
-}
-
-String getUnknownCommandDesc(Map descMap) {
-    return 'Unknown CL: ' + (descMap.cluster ? descMap.cluster : descMap.clusterId) + " CM: '$descMap.command'"
 }
 
 void openCloseReceived(boolean open) {
@@ -284,6 +286,7 @@ void setPosition(position) {
         logger('W', {"setPosition received an unexpected parameter (${position}), skipping"})
         return
     }
+    state.pendingPosition = null
     if (isMoving()) {
         logger('D', 'Motor is still moving, pausing instead of setting position')
         stopPositionChange()
@@ -300,8 +303,9 @@ void setPosition(position) {
     logger('D', {"direction is ${state.desiredPosition > currentPos ? 'up' : 'down'}"})
     if (state.desiredPosition > 0 && state.desiredPosition <= INVERTED_THRESHOLD && currentPos > INVERTED_THRESHOLD) {
         logger('D', 'Using inverted movement for accuracy')
-        runInMillis(calcTimeToReach(0) + settings.openCloseSafetyMargin, 'setPosition', [data: state.desiredPosition])
+        def pendingPos = state.desiredPosition
         setPosition(0)
+        state.pendingPosition = pendingPos
         return
     }
     if (isUpwards()) { sendOpenCommand() } else { sendCloseCommand() }
@@ -359,6 +363,15 @@ void setTurboMode(int val) {
 // Position Estimation
 ///////////////////////////
 
+// Pure: time (ms) to travel from currentPos to targetPos at the given full-travel time, plus the
+// motor start delay. Distance is a linear fraction of the full-travel time. Covered by
+// WindowShadeTimedSpec. (Semi-blind and safety-margin handling stay in calcTimeToReach.)
+long calcTravelTime(Number currentPos, Number targetPos, long travelTimeMs, long startDelayMs) {
+    double distanceFactor = Math.abs(targetPos - currentPos) / 100
+    long travel = distanceFactor * travelTimeMs
+    return travel + startDelayMs
+}
+
 long calcTimeToReach(position) {
     // Semi-blind: use fixed time instead of percentage-based calculation
     if (position == SEMI_BLIND_POSITION && settings.semiBlindTime > 0) {
@@ -366,22 +379,19 @@ long calcTimeToReach(position) {
         logger('D', {"Semi-blind timeToReach position ${position} is ${timeToReach}ms"})
         return timeToReach
     }
-    double distanceFactor = Math.abs(position - getCurrentPosition()) / 100
-    long timeToReach = distanceFactor * getOpenOrCloseTime()
-    timeToReach += getOpenOrCloseStartDelay()
-    logger('D', {"timeToReach position ${position} is ${timeToReach}"})
+    long timeToReach = calcTravelTime(getCurrentPosition(), position, getOpenOrCloseTime(), getOpenOrCloseStartDelay())
     long safetyMargin = (position == FULLY_CLOSED || position == FULLY_OPENED ? settings.openCloseSafetyMargin : 0)
-    logger('D', {"adding a safety margin of ${safetyMargin}"})
+    logger('D', {"timeToReach position ${position} is ${timeToReach}, safety margin ${safetyMargin}"})
     return timeToReach + safetyMargin
 }
 
 void calculateCommandDelay() {
-    def delay = (now() - state.commandSendTime) / 2
+    def delay = ((now() - state.commandSendTime) / 2) as Integer
     if (delay > ZIGBEE_DELAY_LIMIT) {
-        logger('W', {"Zigbee command delay was ${delay}ms, keeping last value: ${state.zigbeeCommandDelay}ms"})
+        logger('W', {"Zigbee command delay was ${delay}ms (outlier), keeping last value: ${state.zigbeeCommandDelay}ms"})
     } else {
-        state.zigbeeCommandDelay = delay
-        logger('D', {"New Zigbee command delay is ${state.zigbeeCommandDelay}ms"})
+        state.zigbeeCommandDelay = (state.zigbeeCommandDelay * 0.7 + delay * 0.3) as Integer
+        logger('D', {"Zigbee command delay: ${delay}ms, EMA: ${state.zigbeeCommandDelay}ms"})
     }
 }
 
@@ -416,8 +426,9 @@ void prePauseCommand() {
         return
     }
     if (delay <= 0) {
-        logger('W', {"pre-pause delay not positive: ${delay}, changing to 50ms"})
-        delay = 50
+        logger('D', {"pre-pause firing immediately (${delay}ms late)"})
+        sendPauseCommand()
+        return
     }
     runInMillis(delay, 'sendPauseCommand')
     logger('D', 'Pre-pause scheduled a sendPauseCommand')
@@ -428,7 +439,7 @@ void setPauseSchedule(long time) {
     if ((state.pauseSchedule == 0 || pauseIn < state.pauseSchedule) && pauseIn > 0) {
         state.pauseSchedule = pauseIn
         state.scheduledPauseTime = now() + pauseIn
-        long runIn = state.pauseSchedule - 100
+        long runIn = state.pauseSchedule - 500
         if (runIn <= 0) {
             prePauseCommand()
         } else {
@@ -442,11 +453,12 @@ void setPauseSchedule(long time) {
 
 void recoverStaleState() {
     unschedule('safetyTimeoutCheck')
-    long recoveredPosition = isUpwards() ? FULLY_OPENED : FULLY_CLOSED
-    logger('W', {"Stale state recovery: assuming device reached ${isUpwards() ? 'open' : 'closed'} limit (${recoveredPosition}%)"})
+    long recoveredPosition = state.desiredPosition
+    logger('W', {"Stale state recovery: assuming device reached target position (${recoveredPosition}%)"})
     state.pauseSchedule = 0
     updateWindowShade(recoveredPosition)
     sendPauseCommand()
+    schedulePendingPosition()
 }
 
 void safetyTimeoutCheck() {
@@ -454,6 +466,20 @@ void safetyTimeoutCheck() {
         logger('W', 'Safety timeout: device still marked as moving after expected time. Recovering...')
         recoverStaleState()
     }
+}
+
+void schedulePendingPosition() {
+    if (state.pendingPosition != null) {
+        logger('D', {"Scheduling pending position: ${state.pendingPosition}%"})
+        runInMillis(200, 'resumePendingPosition')
+    }
+}
+
+void resumePendingPosition() {
+    if (state.pendingPosition == null) return
+    def pos = state.pendingPosition
+    logger('I', {"Resuming pending position: ${pos}%"})
+    setPosition(pos)
 }
 
 boolean isUpwards() {
@@ -464,26 +490,29 @@ boolean isMoving() {
     return device.currentValue('windowShade') in ['opening', 'closing']
 }
 
+// Pure: estimate the position reached after moving for elapsedMs at the given full-travel time and
+// direction, starting from currentPos. Rounds the delta to 0.1% (HALF_UP) and clamps to the
+// [FULLY_CLOSED, FULLY_OPENED] range. Covered by WindowShadeTimedSpec.
+Number estimatePosition(Number currentPos, long elapsedMs, long travelTimeMs, boolean upwards) {
+    double positionsMoved = (upwards ? 1 : -1) * (elapsedMs / travelTimeMs) * 100
+    Number newPos = currentPos + new BigDecimal(positionsMoved).setScale(1, RoundingMode.HALF_UP)
+    if (newPos > FULLY_OPENED) return FULLY_OPENED
+    if (newPos < FULLY_CLOSED) return FULLY_CLOSED
+    return newPos
+}
+
 void updatePosition() {
     long elapsedTime = state.pauseTime - state.motionStartTime
-    logger('D', {"Elapsed time: ${elapsedTime}"})
-    logger('D', {"isUpwards() = ${isUpwards()}"})
-    double positionsMoved = (isUpwards() ? 1 : -1) * (elapsedTime / getOpenOrCloseTime()) * 100
-    logger('D', {"Positions moved: ${positionsMoved}"})
-    def newPos = getCurrentPosition() + new BigDecimal(positionsMoved).setScale(1, RoundingMode.HALF_UP)
-    if (newPos > FULLY_OPENED) {
-        logger('D', {"Limiting position level to ${FULLY_OPENED}"})
-        newPos = FULLY_OPENED
-    } else if (newPos < FULLY_CLOSED) {
-        logger('D', {"Limiting position level to ${FULLY_CLOSED}"})
-        newPos = FULLY_CLOSED
-    }
+    logger('D', {"Elapsed time: ${elapsedTime}, isUpwards() = ${isUpwards()}"})
+    Number newPos = estimatePosition(getCurrentPosition(), elapsedTime, getOpenOrCloseTime(), isUpwards())
+    logger('D', {"New estimated position: ${newPos}%"})
     updateWindowShade(newPos)
+    schedulePendingPosition()
 }
 
 void updateWindowShade(pos) {
     sendEvent(name: 'position', value: pos)
-    logger('I', {"New position is ${pos}%"})
+    logger('I', {"New position is ${pos}%${getHumanPosition(pos)}"})
     if (pos > FULLY_CLOSED && pos < FULLY_OPENED) {
         sendEvent(name: 'windowShade', value: 'partially open')
     } else {
@@ -523,6 +552,7 @@ void resetState() {
     state.commandSendTime = 0
     state.lastCommandSent = 'none'
     state.desiredPosition = state.resetPosition
+    state.pendingPosition = null
     state.zigbeeCommandDelay = 50
     if (getCurrentPosition() == null) {
         updateWindowShade(state.resetPosition)
@@ -543,6 +573,36 @@ boolean isSonoff() {
 
 Integer safeToInt(val, Integer defaultVal=0) {
     return "${val}"?.isInteger() ? "${val}".toInteger() : defaultVal
+}
+
+void logReceivedCommand(command, Map descMap) {
+    String zclCmd = descMap.command
+    String cluster = descMap.cluster ?: descMap.clusterId
+    if (command == null) {
+        logger('D', {"Received ZCL: ${getZclCommandLabel(zclCmd)} (cluster: ${cluster}, zclCmd: ${zclCmd})"})
+        return
+    }
+    if (getCachedLoggingLevel() < 3) return
+    String label = getCommandLabel(command)
+    logger('I', "Received action: ${label} (data: ${command}, cluster: ${cluster}, zclCmd: ${zclCmd})")
+}
+
+String getCommandLabel(String command) {
+    if (command == getInCommandPause()) return 'Pause'
+    if (command == getInCommandOpen()) return 'Open'
+    if (command == getInCommandClose()) return 'Close'
+    return 'Unknown'
+}
+
+String getZclCommandLabel(String zclCmd) {
+    switch (zclCmd) {
+        case '04': return 'Write Attributes Response'
+        case '06': return 'Configure Reporting'
+        case '07': return 'Configure Reporting Response'
+        case '0A': return 'Report Attributes'
+        case '0B': return 'Default Response'
+        default: return "Unknown ZCL command ${zclCmd}"
+    }
 }
 
 String getHumanPosition(pos) {

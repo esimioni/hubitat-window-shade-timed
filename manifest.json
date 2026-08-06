@@ -1,9 +1,9 @@
 {
     "packageName": "Window Shade Timed",
     "author": "Eduardo Simioni",
-    "version": "1.1.1",
-    "minimumHEVersion": "2.2.0",
-    "dateReleased": "2026-03-10",
+    "version": "1.1.2",
+    "minimumHEVersion": "2.2.9",
+    "dateReleased": "2026-08-06",
     "drivers": [
         {
             "id": "f9e1f5b0-c5e5-4f3c-b8f9-2e1b8a0b1b9e",
