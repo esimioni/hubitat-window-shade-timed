@@ -32,7 +32,12 @@ switches the commands sent/received (`OUT/IN_COMMAND_TUYA_*` vs `*_ZCL_*`) and t
 - **Semi-blind (3%)**: fixed time-based position (`semiBlindTime`), for cellular-shade cells.
 - **Inverted threshold (≤5%)**: for accuracy near the lower limit, fully close first, then position
   (`state.pendingPosition`).
-- **Turbo Mode** (Sonoff only): raises the Zigbee radio power (cluster `0xFC11`, attr `0x0012`).
+- **Turbo Mode** (Sonoff only): raises the Zigbee radio power (cluster `0xFC11`, attr `0x0012`, INT16
+  9/20), written on *Save Preferences*. ⚠️ It must be a **plain ZCL write, no manufacturer code**: the
+  MINI-ZBRBS answers `UNSUPPORTED_ATTRIBUTE` (0x86) to the manufacturer-specific write (mfgCode 0x1286,
+  the Sonoff ZBMicro variant in kkossev's driver) — up to 1.1.2 the setting never took effect. Measured
+  2026-09-29: plain write → `SUCCESS` on all 11 shades with it enabled. The device's answer is logged
+  (`Turbo Mode … confirmed by the device` / `REJECTED … (ZCL status 0x..)`).
 - Recovery: `safetyTimeoutCheck` / `recoverStaleState` if a pause command is lost.
 
 ## Pure logic under test
@@ -44,6 +49,8 @@ reads settings):
 - `calcTravelTime(currentPos, targetPos, travelTimeMs, startDelayMs)` — linear time to cover the %
   distance plus the motor start delay. (was inline in `calcTimeToReach`; semi-blind and the safety
   margin stay in `calcTimeToReach`, which depends on `settings`)
+- `turboWriteStatus(descMap)` — the ZCL status of the device's Write Attributes Response on `0xFC11`
+  (0 = accepted), or null when the message is something else. (logging stays in `logTurboWriteResult`)
 
 ## Tests
 

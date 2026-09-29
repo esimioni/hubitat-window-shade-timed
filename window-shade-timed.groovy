@@ -65,6 +65,10 @@
  * Author: Eduardo Simioni
  *
  * Changelog:
+ * 1.1.3 (unreleased) [Eduardo Simioni] - Fixed Turbo Mode on the Sonoff MINI-ZBRBS: the setting was sent as a
+ *                                        manufacturer-specific write, which the device rejects, so it never took
+ *                                        effect. It is now a plain ZCL write, and the device's answer is logged
+ *                                        (confirmed, or rejected with the ZCL status).
  * 1.1.2 (2026-08-06) [Eduardo Simioni] - Fixed positions drifting after back-to-back commands: the driver now runs
  *                                        single threaded, so concurrent executions can no longer overwrite each
  *                                        other's state and make the driver measure travel from an earlier movement.
@@ -159,6 +163,7 @@ def parse(String description) {
     }
     Map descMap = zigbee.parseDescriptionAsMap(description)
     logger('D', {"descMap ${descMap}"})
+    Integer turboStatus = turboWriteStatus(descMap)
     if (descMap && descMap.clusterInt == CLUSTER_SHADE_BLIND) {
         logger('D', 'Shade cluster command received')
         def command = getCommandFromDescMap(descMap)
@@ -173,8 +178,29 @@ def parse(String description) {
         pauseReceived()
     } else if (descMap && descMap.clusterInt == 0 && descMap.encoding == '20' && descMap.command == '01' && descMap.value == '03') {
         logger('I', 'Ping received')
+    } else if (turboStatus != null) {
+        logTurboWriteResult(turboStatus)
     } else {
         logger('D', 'DID NOT PARSE UNKNOWN MESSAGE')
+    }
+}
+
+// Pure: the device's answer to setTurboMode() — the ZCL status of a Write Attributes Response (0x04) on the
+// Sonoff custom cluster. 0 = accepted; otherwise the status of the first failed record (e.g. 0x86
+// UNSUPPORTED_ATTRIBUTE); null when descMap is not such a response. Covered by WindowShadeTimedSpec.
+Integer turboWriteStatus(Map descMap) {
+    if (descMap?.clusterInt != CLUSTER_SONOFF_CUSTOM || descMap.command != '04' || !descMap.data) {
+        return null
+    }
+    return Integer.parseInt(descMap.data[0] as String, 16)
+}
+
+void logTurboWriteResult(Integer status) {
+    String mode = settings.turboMode == '20' ? 'Enabled' : 'Disabled'
+    if (status == 0) {
+        logger('I', {"Turbo Mode ${mode} - confirmed by the device"})
+    } else {
+        logger('W', {"Turbo Mode ${mode} - REJECTED by the device (ZCL status 0x${Integer.toHexString(status).toUpperCase()}), the device keeps its previous radio power"})
     }
 }
 
@@ -354,7 +380,10 @@ void registerSentCommand(String name) {
 void setTurboMode(int val) {
     if (isSonoff()) {
         logger('I', {"setting Turbo Mode to: ${val == 20 ? 'Enabled' : 'Disabled'} (raw ${val})"})
-        sendZigbeeCommands(zigbee.writeAttribute(CLUSTER_SONOFF_CUSTOM, ATTR_TURBO_MODE, DataType.INT16, val, [destEndpoint:0x01, mfgCode:0x1286], delay = 200))
+        // Plain ZCL write, no manufacturer code: the MINI-ZBRBS answers UNSUPPORTED_ATTRIBUTE (0x86) to the
+        // manufacturer-specific write (mfgCode 0x1286, the Sonoff ZBMicro variant) and SUCCESS to this one, like the
+        // ZBMINIR2. The device's answer is logged by logTurboWriteResult().
+        sendZigbeeCommands(zigbee.writeAttribute(CLUSTER_SONOFF_CUSTOM, ATTR_TURBO_MODE, DataType.INT16, val, [destEndpoint:0x01], delay = 200))
     }
 }
 

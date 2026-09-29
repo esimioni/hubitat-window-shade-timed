@@ -83,4 +83,18 @@ class WindowShadeTimedSpec extends Specification {
         'abc' | 9    || 9       // non-integer -> default
         null  | 3    || 3       // null -> default
     }
+
+    @Unroll
+    def "turboWriteStatus: cluster #cluster, zclCmd #cmd, data #data -> #expected"() {
+        expect:
+        driver.turboWriteStatus([clusterInt: cluster, command: cmd, data: data]) == expected
+
+        where:
+        cluster | cmd  | data               || expected
+        0xFC11  | '04' | ['00']             || 0x00    // Write Attributes Response: every write succeeded
+        0xFC11  | '04' | ['86', '12', '00'] || 0x86    // UNSUPPORTED_ATTRIBUTE for 0x0012 (MINI-ZBRBS, mfg-specific write, 29/09/2026)
+        0xFC11  | '0B' | ['02', '00']       || null    // a Default Response, not a Write Attributes Response
+        0x0102  | '04' | ['00']             || null    // another cluster
+        0xFC11  | '04' | []                 || null    // malformed: no status byte
+    }
 }
