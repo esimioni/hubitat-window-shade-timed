@@ -7,8 +7,8 @@
     "drivers": [
         {
             "id": "f9e1f5b0-c5e5-4f3c-b8f9-2e1b8a0b1b9e",
-            "name": "Window Shade Timed",
-            "namespace": "esimioni",
+            "name": "Zigbee Window Shade/Blind (Timed)",
+            "namespace": "edu",
             "location": "https://raw.githubusercontent.com/esimioni/hubitat-window-shade-timed/main/window-shade-timed.groovy",
             "required": true
         }
