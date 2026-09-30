@@ -65,7 +65,7 @@
  * Author: Eduardo Simioni
  *
  * Changelog:
- * 1.1.3 (unreleased) [Eduardo Simioni] - Fixed Turbo Mode on the Sonoff MINI-ZBRBS: the setting was sent as a
+ * 1.1.4 (2026-09-30) [Eduardo Simioni] - Fixed Turbo Mode on the Sonoff MINI-ZBRBS: the setting was sent as a
  *                                        manufacturer-specific write, which the device rejects, so it never took
  *                                        effect. It is now a plain ZCL write, and the device's answer is logged
  *                                        (confirmed, or rejected with the ZCL status).
